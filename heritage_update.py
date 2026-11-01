@@ -123,21 +123,46 @@ def login_to_heritage(page: Page) -> bool:
 
     log.info("Logging in to Heritage...")
     try:
-        page.goto("https://www.ha.com/c/login.zx", wait_until="domcontentloaded", timeout=30000)
-        slow_wait(page, 2.0)
+        # Reduce bot signals
+        page.set_extra_http_headers({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        page.goto("https://www.ha.com/c/login.zx", wait_until="domcontentloaded", timeout=45000)
+        slow_wait(page, 3.5)
 
-        user_field = page.locator("input[name='username'], input[type='email'], #username").first
-        user_field.wait_for(state="visible", timeout=10000)
+        # Try multiple selectors and wait longer
+        user_field = None
+        for sel in [
+            "input[name='username']",
+            "input[type='email']",
+            "#username",
+            "input[placeholder*='user' i]",
+            "input[placeholder*='email' i]",
+        ]:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                try:
+                    el.wait_for(state="visible", timeout=8000)
+                    user_field = el
+                    break
+                except Exception:
+                    continue
+
+        if not user_field:
+            log.warning("Could not find username field.")
+            return False
+
         user_field.fill(username)
-        human_delay(0.6, 1.2)
+        human_delay(0.8, 1.5)
 
         pass_field = page.locator("input[name='password'], input[type='password'], #password").first
+        pass_field.wait_for(state="visible", timeout=8000)
         pass_field.fill(password)
-        human_delay(0.5, 1.0)
+        human_delay(0.6, 1.2)
 
-        submit = page.locator("button[type='submit'], input[type='submit'], .login-button").first
+        submit = page.locator("button[type='submit'], input[type='submit'], .login-button, button:has-text('Sign In'), button:has-text('Log In')").first
         submit.click()
-        slow_wait(page, 3.0)
+        slow_wait(page, 4.0)
         log.info("Login submitted.")
         return True
     except Exception as e:
