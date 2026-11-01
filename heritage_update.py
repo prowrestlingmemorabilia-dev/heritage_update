@@ -96,11 +96,11 @@ def get_supabase() -> Client:
     return create_client(require_env("SUPABASE_URL"), require_env("SUPABASE_SERVICE_KEY"))
 
 def fetch_existing_heritage(supabase: Client) -> List[dict]:
-    """Return list of Heritage records with id, current_price, item_url."""
+    """Return list of Heritage records with id, current_price, item_url, end_time."""
     try:
         resp = (
             supabase.table("auctions")
-            .select("id, current_price, item_url, bid_count")
+            .select("id, current_price, item_url, bid_count, end_time")
             .eq("auction_house", AUCTION_HOUSE_NAME)
             .execute()
         )
@@ -179,8 +179,18 @@ def check_item(page: Page, record: dict) -> Optional[dict]:
 
         current_price = parse_price(price_text)
 
-        # If we got no price at all, treat as ended and mark for deletion
+        # If we got no price at all, only delete if end_time has passed by at least 1 hour
         if current_price == 0.0 and not price_text:
+            end_iso = record.get("end_time")
+            if end_iso:
+                try:
+                    from datetime import datetime, timezone, timedelta
+                    end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    if datetime.now(timezone.utc) < end_dt + timedelta(hours=1):
+                        log.info("  No price but end_time not yet +1h for %s — skipping delete", item_id)
+                        return None
+                except Exception:
+                    pass
             log.info("  ENDED or missing %s — marking for delete", item_id)
             return {"id": item_id, "_delete": True}
 
@@ -233,7 +243,11 @@ def main():
                 browser = p.chromium.launch(headless=True)
                 context = browser.new_context()
                 page = context.new_page()
-                login_to_heritage(page)
+                logged_in = login_to_heritage(page)
+                if not logged_in:
+                    log.error("Login failed. Skipping all checks to avoid false deletions.")
+                    send_email("❌ Heritage Update FAILED", "Login failed on GitHub Actions.\nNo records were checked or deleted.")
+                    return
             else:
                 log.info("Connecting to Chrome on %s ...", CDP_URL)
                 browser = p.chromium.connect_over_cdp(CDP_URL)
