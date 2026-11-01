@@ -7,6 +7,7 @@ Heritage Auctions – Update Only
 - Visits each item URL
 - If current price is unchanged → skip immediately
 - If price changed → grab bid count and upsert
+- If no price found → mark for deletion
 
 Environment variables:
   SUPABASE_URL, SUPABASE_SERVICE_KEY
@@ -123,6 +124,7 @@ def check_item(page: Page, record: dict) -> Optional[dict]:
     """
     Visit the item page.
     Returns updated fields if price changed, None if unchanged or failed.
+    Returns {"id": ..., "_delete": True} if the item appears ended.
     """
     url = record.get("item_url")
     if not url:
@@ -150,6 +152,11 @@ def check_item(page: Page, record: dict) -> Optional[dict]:
                 break
 
         current_price = parse_price(price_text)
+
+        # If we got no price at all, treat as ended and mark for deletion
+        if current_price == 0.0 and not price_text:
+            log.info("  ENDED or missing %s — marking for delete", item_id)
+            return {"id": item_id, "_delete": True}
 
         if abs(current_price - old_price) < 0.01:
             log.info("  SKIP (price unchanged) %s — $%.2f", item_id, current_price)
@@ -190,6 +197,7 @@ def main():
             return
 
         to_update = []
+        to_delete = []
         checked = 0
         skipped = 0
 
@@ -212,6 +220,8 @@ def main():
                 checked += 1
                 if result is None:
                     skipped += 1
+                elif result.get("_delete"):
+                    to_delete.append(result["id"])
                 else:
                     to_update.append(result)
 
@@ -227,7 +237,13 @@ def main():
         else:
             log.info("No price changes found.")
 
-        log.info("Done. Checked %d | Updated %d | Skipped %d", checked, len(to_update), skipped)
+        if to_delete:
+            supabase.table("auctions").delete().in_("id", to_delete).execute()
+            log.info("Deleted %d ended Heritage auctions", len(to_delete))
+        else:
+            log.info("No ended auctions to delete.")
+
+        log.info("Done. Checked %d | Updated %d | Deleted %d | Skipped %d", checked, len(to_update), len(to_delete), skipped)
 
     except Exception:
         log.error("Script failed:\n%s", traceback.format_exc())
