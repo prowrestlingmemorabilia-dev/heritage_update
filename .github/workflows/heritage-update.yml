@@ -31,8 +31,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          HERITAGE_USERNAME: ${{ secrets.HERITAGE_USERNAME }}
-          HERITAGE_PASSWORD: ${{ secrets.HERITAGE_PASSWORD }}
+          HERITAGE_COOKIES: ${{ secrets.HERITAGE_COOKIES }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
