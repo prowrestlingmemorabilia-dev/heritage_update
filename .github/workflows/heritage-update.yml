@@ -1,4 +1,4 @@
-name: Heritage Auction Update
+name: Heritage/Pristine Auction Update
 
 on:
   schedule:
@@ -35,4 +35,4 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python heritage_update.py
+        run: python heritage_pristine_update.py
