@@ -1,11 +1,13 @@
 """
 Heritage / Pristine Auction Update
 ----------------------------------
-Lean price-update only.
-- Loads existing live records for Heritage and Pristine from Supabase
-- Visits each item URL
-- If current price is unchanged → skip immediately
-- If price changed → grab bid count (when available) and upsert
+Fast price-update only.
+
+1. Load existing records from Supabase (id, item_name, current_price, item_url)
+2. Run broad keyword / category searches
+3. Match search-page results by item name
+4. If search-page price == Supabase price → skip
+5. If price differs → open the detail URL, grab bid count, upsert
 
 Environment variables:
   SUPABASE_URL, SUPABASE_SERVICE_KEY
@@ -23,6 +25,7 @@ import smtplib
 import json
 from email.mime.text import MIMEText
 from typing import Dict, List, Optional
+from urllib.parse import quote, urljoin
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext
 from playwright_stealth import Stealth
@@ -34,28 +37,21 @@ from supabase import create_client, Client
 CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
 HOT_BID_THRESHOLD = 5
 
-HOUSES = {
-    "Heritage Auctions": {
-        "price_selectors": [
-            "div.item-value",
-            ".current-bid",
-            ".lot-current-bid",
-            "span.current-bid",
-            ".price",
-        ],
-        "bid_selectors": ["span#number-bids", ".bids", "[class*='bid']"],
-    },
-    "Pristine Auction": {
-        "price_selectors": [
-            ".current-bid",
-            ".bid-price",
-            ".price",
-            "span.price",
-            "[class*='price']",
-        ],
-        "bid_selectors": ["span.bid-count", ".bids", "[class*='bid']", "text=/\\d+\\s+bids?/i"],
-    },
-}
+HERITAGE_KEYWORDS = [
+    "wrestling", "wwe", "wwf", "wcw", "aew", "ecw",
+    "hulk hogan", "stone cold steve austin", "dwayne johnson", "john cena", "brock lesnar",
+    "ronda rousey", "ernie ladd", "wahoo mcdaniel", "roddy piper", "steve mcmichael",
+    "ultimate warrior americana", "rhea ripley", "andre the giant",
+    "cody rhodes", "Macho Man Randy Savage", "Shawn Michaels",
+    "Bret Hart", "Triple H", "CM Punk", "Randy Orton", "Bill Goldberg", "Sgt Slaughter", "Mick Foley",
+    "Vince McMahon", "Charlotte Flair", "Dusty Rhodes", "Iron Sheik", "Rey Mysterio", "Jake Roberts",
+    "Torrie Wilson", "Dave Bautista", "Adam Copeland", "Stephanie McMahon", "penta zero miedo",
+    "Maxwell Jacob Friedman", "Kurt Angle", "Undertaker", "Ric Flair", "Joe Anoa'i",
+]
+
+PRISTINE_CROSSOVER = [
+    "ronda rousey", "dave bautista", "brock lesnar", "hulk hogan", "dwayne johnson",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,13 +80,19 @@ def parse_price(price_str: str) -> float:
             pass
     return 0.0
 
-def human_delay(min_sec: float = 1.2, max_sec: float = 2.6):
+def norm_title(title: str) -> str:
+    """Normalize title for matching (lowercase, collapse whitespace)."""
+    if not title:
+        return ""
+    return re.sub(r"\s+", " ", title.lower().strip())
+
+def human_delay(min_sec: float = 1.0, max_sec: float = 2.2):
     delay = random.uniform(min_sec, max_sec)
-    if random.random() < 0.1:
-        delay += random.uniform(1.0, 2.5)
+    if random.random() < 0.08:
+        delay += random.uniform(0.8, 2.0)
     time.sleep(delay)
 
-def slow_wait(page: Page, seconds: float = 1.4):
+def slow_wait(page: Page, seconds: float = 1.3):
     page.wait_for_timeout(int(seconds * 1000))
 
 def send_email(subject: str, body: str):
@@ -119,11 +121,11 @@ def get_supabase() -> Client:
     return create_client(require_env("SUPABASE_URL"), require_env("SUPABASE_SERVICE_KEY"))
 
 def fetch_existing(supabase: Client, house: str) -> List[dict]:
-    """Return list of records for one auction house."""
+    """Return records with id, item_name, current_price, item_url, bid_count."""
     try:
         resp = (
             supabase.table("auctions")
-            .select("id, current_price, item_url, bid_count")
+            .select("id, item_name, current_price, item_url, bid_count")
             .eq("auction_house", house)
             .execute()
         )
@@ -154,7 +156,7 @@ def load_cookies(context: BrowserContext) -> bool:
 def verify_session(page: Page) -> bool:
     try:
         page.goto("https://www.ha.com/", wait_until="domcontentloaded", timeout=45000)
-        slow_wait(page, 2.5)
+        slow_wait(page, 2.0)
         body = page.locator("body").inner_text()[:600].lower()
         title = page.title()
         log.info("Session check — title: %s", title)
@@ -168,47 +170,76 @@ def verify_session(page: Page) -> bool:
         return False
 
 # ---------------------------------------------------------------------------
-# CHECK ONE ITEM
+# SEARCH-PAGE SCRAPERS (title + price only)
 # ---------------------------------------------------------------------------
-def check_item(page: Page, record: dict, house: str) -> Optional[dict]:
-    """
-    Visit the item page.
-    Returns updated fields if price changed, None if unchanged or failed.
-    """
+def scrape_heritage_search(page: Page, keyword: str) -> Dict[str, float]:
+    """Return {normalized_title: price} from one Heritage search results page."""
+    found: Dict[str, float] = {}
+    encoded = quote(keyword)
+    url = f"https://www.ha.com/c/search/results.zx?term={encoded}&mode=live&page=200%7E1"
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+        slow_wait(page, 2.0)
+        items = page.locator("li.item-block.list, li.item-block")
+        count = items.count()
+        for i in range(count):
+            el = items.nth(i)
+            title_el = el.locator("a.item-title, a.item-title.short").first
+            title = title_el.inner_text().strip() if title_el.count() > 0 else ""
+            if not title:
+                continue
+            price_el = el.locator("div.item-value").first
+            raw = price_el.inner_text().strip() if price_el.count() > 0 else ""
+            price = parse_price(raw)
+            if price > 0:
+                found[norm_title(title)] = price
+        log.info("  Heritage '%s': %d priced titles", keyword, len(found))
+    except Exception as e:
+        log.warning("  Heritage search failed for '%s': %s", keyword, str(e)[:80])
+    return found
+
+def scrape_pristine_search(page: Page, url: str, label: str) -> Dict[str, float]:
+    """Return {normalized_title: price} from one Pristine search/category page."""
+    found: Dict[str, float] = {}
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+        slow_wait(page, 1.8)
+        links = page.locator("a[href*='/a']").all()
+        for link in links:
+            title = (link.inner_text() or "").strip()
+            if not title or len(title) < 8:
+                continue
+            container = link
+            for _ in range(3):
+                parent = container.locator("xpath=..").first
+                if parent.count() == 0:
+                    break
+                container = parent
+            text = container.inner_text()
+            price = parse_price(text)
+            if price > 0:
+                found[norm_title(title)] = price
+        log.info("  Pristine '%s': %d priced titles", label, len(found))
+    except Exception as e:
+        log.warning("  Pristine search failed for '%s': %s", label, str(e)[:80])
+    return found
+
+# ---------------------------------------------------------------------------
+# DETAIL PAGE (only called when price differs)
+# ---------------------------------------------------------------------------
+def update_from_detail(page: Page, record: dict, house: str, new_price: float) -> Optional[dict]:
+    """Open the item URL and return fields to upsert."""
     url = record.get("item_url")
+    item_id = record.get("id")
     if not url:
         return None
-
-    old_price = float(record.get("current_price") or 0)
-    item_id = record.get("id")
-    cfg = HOUSES.get(house, HOUSES["Heritage Auctions"])
-
     try:
-        human_delay(1.0, 2.0)
+        human_delay(0.8, 1.6)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        slow_wait(page, 1.2)
-
-        price_text = ""
-        for sel in cfg["price_selectors"]:
-            el = page.locator(sel).first
-            if el.count() > 0:
-                price_text = el.inner_text().strip()
-                break
-
-        current_price = parse_price(price_text)
-
-        if current_price == 0.0 and not price_text:
-            log.info("  No price found for %s — skipping", item_id)
-            return None
-
-        if abs(current_price - old_price) < 0.01:
-            log.info("  SKIP (price unchanged) %s — $%.2f", item_id, current_price)
-            return None
-
-        log.info("  PRICE CHANGED %s — was $%.2f now $%.2f", item_id, old_price, current_price)
+        slow_wait(page, 1.0)
 
         bid_count = int(record.get("bid_count") or 0)
-        for sel in cfg["bid_selectors"]:
+        for sel in ["span#number-bids", "span.bid-count", ".bids", "[class*='bid']"]:
             el = page.locator(sel).first
             if el.count() > 0:
                 raw = el.inner_text()
@@ -217,16 +248,16 @@ def check_item(page: Page, record: dict, house: str) -> Optional[dict]:
                     bid_count = int(m.group(1))
                     break
 
+        log.info("  UPDATED %s — $%.2f → $%.2f (%d bids)", item_id, record.get("current_price", 0), new_price, bid_count)
         return {
             "id": item_id,
             "auction_house": house,
-            "current_price": current_price,
+            "current_price": new_price,
             "bid_count": bid_count,
             "is_hot": bid_count >= HOT_BID_THRESHOLD,
         }
-
     except Exception as e:
-        log.warning("  Failed to check %s: %s", item_id, str(e)[:80])
+        log.warning("  Detail update failed for %s: %s", item_id, str(e)[:80])
         return None
 
 # ---------------------------------------------------------------------------
@@ -235,7 +266,6 @@ def check_item(page: Page, record: dict, house: str) -> Optional[dict]:
 def main():
     try:
         supabase = get_supabase()
-
         all_to_update = []
         summary = {}
 
@@ -260,7 +290,6 @@ def main():
                 )
                 Stealth().apply_stealth_sync(context)
                 page = context.new_page()
-
                 if not load_cookies(context):
                     log.warning("No Heritage cookies — Heritage checks may be limited.")
                 else:
@@ -271,39 +300,87 @@ def main():
                 context = browser.contexts[0]
                 page = context.pages[0] if context.pages else context.new_page()
 
-            for house in ("Heritage Auctions", "Pristine Auction"):
-                log.info("=== %s ===", house)
-                existing = fetch_existing(supabase, house)
-                summary[house] = {"checked": 0, "updated": 0, "skipped": 0}
+            # ----- Heritage -----
+            log.info("=== Heritage Auctions ===")
+            heritage_existing = fetch_existing(supabase, "Heritage Auctions")
+            heritage_by_title: Dict[str, List[dict]] = {}
+            for rec in heritage_existing:
+                key = norm_title(rec.get("item_name") or "")
+                if key:
+                    heritage_by_title.setdefault(key, []).append(rec)
 
-                for idx, record in enumerate(existing, 1):
-                    log.info("[%d/%d] %s", idx, len(existing), record.get("id"))
-                    result = check_item(page, record, house)
-                    summary[house]["checked"] += 1
-                    if result is None:
-                        summary[house]["skipped"] += 1
-                    else:
-                        all_to_update.append(result)
-                        summary[house]["updated"] += 1
+            heritage_search_prices: Dict[str, float] = {}
+            for kw in HERITAGE_KEYWORDS:
+                heritage_search_prices.update(scrape_heritage_search(page, kw))
+                human_delay(0.6, 1.2)
 
-                    if random.random() < 0.12:
-                        human_delay(1.4, 2.8)
+            summary["Heritage Auctions"] = {"matched": 0, "updated": 0, "skipped": 0}
+            for title, price in heritage_search_prices.items():
+                recs = heritage_by_title.get(title, [])
+                if not recs:
+                    continue
+                summary["Heritage Auctions"]["matched"] += len(recs)
+                for rec in recs:
+                    old = float(rec.get("current_price") or 0)
+                    if abs(old - price) < 0.01:
+                        summary["Heritage Auctions"]["skipped"] += 1
+                        continue
+                    updated = update_from_detail(page, rec, "Heritage Auctions", price)
+                    if updated:
+                        all_to_update.append(updated)
+                        summary["Heritage Auctions"]["updated"] += 1
+
+            # ----- Pristine -----
+            log.info("=== Pristine Auction ===")
+            pristine_existing = fetch_existing(supabase, "Pristine Auction")
+            pristine_by_title: Dict[str, List[dict]] = {}
+            for rec in pristine_existing:
+                key = norm_title(rec.get("item_name") or "")
+                if key:
+                    pristine_by_title.setdefault(key, []).append(rec)
+
+            pristine_search_prices: Dict[str, float] = {}
+            # Wrestling category
+            wrestling_url = "https://www.pristineauction.com/auctions/index/index/category/wrestling"
+            pristine_search_prices.update(scrape_pristine_search(page, wrestling_url, "wrestling"))
+            human_delay(0.6, 1.2)
+            # Crossover names
+            for kw in PRISTINE_CROSSOVER:
+                encoded = quote(kw)
+                url = f"https://www.pristineauction.com/auction/search/?term={encoded}&per_page=60"
+                pristine_search_prices.update(scrape_pristine_search(page, url, kw))
+                human_delay(0.6, 1.2)
+
+            summary["Pristine Auction"] = {"matched": 0, "updated": 0, "skipped": 0}
+            for title, price in pristine_search_prices.items():
+                recs = pristine_by_title.get(title, [])
+                if not recs:
+                    continue
+                summary["Pristine Auction"]["matched"] += len(recs)
+                for rec in recs:
+                    old = float(rec.get("current_price") or 0)
+                    if abs(old - price) < 0.01:
+                        summary["Pristine Auction"]["skipped"] += 1
+                        continue
+                    updated = update_from_detail(page, rec, "Pristine Auction", price)
+                    if updated:
+                        all_to_update.append(updated)
+                        summary["Pristine Auction"]["updated"] += 1
 
             if os.environ.get("GITHUB_ACTIONS"):
                 browser.close()
 
         if all_to_update:
             supabase.table("auctions").upsert(all_to_update).execute()
-            log.info("Updated %d records with new prices", len(all_to_update))
+            log.info("Upserted %d price updates", len(all_to_update))
         else:
             log.info("No price changes found.")
 
         log.info("Done.")
 
-        # Summary email
         lines = ["Heritage / Pristine Update Report", "=" * 40, ""]
         for house, stats in summary.items():
-            lines.append(f"{house}: checked {stats['checked']} | updated {stats['updated']} | skipped {stats['skipped']}")
+            lines.append(f"{house}: matched {stats['matched']} | updated {stats['updated']} | skipped {stats['skipped']}")
         lines.append("")
         if all_to_update:
             lines.append("Price changes:")
